@@ -3,6 +3,7 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { resolveProviderId } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
+import { getRequestSettings } from "./requestContext.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
@@ -11,10 +12,10 @@ let selectionMutex = Promise.resolve();
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
  * @param {string} provider - Provider name
- * @param {string|null} excludeConnectionId - Connection ID to exclude (for retry with next account)
+ * @param {Set<string>|string|null} excludeConnectionIds - Connection ID(s) to exclude (for retry with next account)
  * @param {string|null} model - Model name for per-model rate limit filtering
  */
-export async function getProviderCredentials(provider, excludeConnectionId = null, model = null) {
+export async function getProviderCredentials(provider, excludeConnectionId = null, model = null, requestContext = null) {
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -27,7 +28,7 @@ export async function getProviderCredentials(provider, excludeConnectionId = nul
     const providerId = resolveProviderId(provider);
 
     const connections = await getProviderConnections({ provider: providerId, isActive: true });
-    log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeId: ${excludeConnectionId || "none"}, model: ${model || "any"}`);
+    log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
       log.warn("AUTH", `No credentials for ${provider}`);
@@ -36,14 +37,14 @@ export async function getProviderCredentials(provider, excludeConnectionId = nul
 
     // Filter out model-locked and excluded connections
     const availableConnections = connections.filter(c => {
-      if (excludeConnectionId && c.id === excludeConnectionId) return false;
+      if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
       return true;
     });
 
     log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${connections.length}`);
     connections.forEach(c => {
-      const excluded = excludeConnectionId && c.id === excludeConnectionId;
+      const excluded = excludeSet.has(c.id);
       const locked = isModelLockActive(c, model);
       if (excluded || locked) {
         const lockUntil = getEarliestModelLockUntil(c);
@@ -71,7 +72,9 @@ export async function getProviderCredentials(provider, excludeConnectionId = nul
       return null;
     }
 
-    const settings = await getSettings();
+    const settings = requestContext
+      ? await getRequestSettings(requestContext)
+      : await getSettings();
     // Per-provider strategy overrides global setting
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
